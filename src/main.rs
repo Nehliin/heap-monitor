@@ -2,6 +2,7 @@ use clap::Parser;
 use futures::stream::StreamExt;
 use std::boxed::Box;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::process;
 use std::process::Command;
@@ -108,21 +109,27 @@ fn main() {
     });
     println!();
 
+    let mut hashset = HashSet::new();
     let mut gdb = Command::new("gdb");
+    //gdb.arg("--directory=/home/oskar/Desktop/ark/target/debug");
+   // gdb.arg("--se=/home/oskar/Desktop/ark/target/debug/ark-client.d");
     gdb.arg(&format!("--pid={pid}"));
     gdb.arg("-batch");
     let acc = acc.lock().unwrap();
     for alloc_size in acc.values() {
-        let src_addr = alloc_size.frames.ip[0];
-        if src_addr == 0x0 {
-            continue;
+        for src_addr in alloc_size.frames.ip.iter() {
+            let src_addr = *src_addr;
+            if src_addr == 0x0 || hashset.contains(&src_addr) {
+                continue;
+            }
+            gdb.arg("-ex");
+            gdb.arg(&format!("info line *{src_addr:#x}"));
+            hashset.insert(src_addr);
         }
-        gdb.arg(&format!("-ex \"info line *{src_addr:#x}\""));
         println!(
             "{} bytes allocated, malloc called {} times at:",
             alloc_size.size, alloc_size.count
         );
-        break;
         /*for ip in alloc_size.frames.ip.iter() {
             if *ip == 0x0 {
                 break;
@@ -134,7 +141,6 @@ fn main() {
     let output = gdb.output().expect("Failed to start gdb");
     println!("Output: {}", String::from_utf8_lossy(&output.stdout));
     println!("Output stderr: {}", String::from_utf8_lossy(&output.stderr));
-
 }
 
 fn probe_code() -> &'static [u8] {
