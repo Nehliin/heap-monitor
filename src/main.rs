@@ -9,14 +9,17 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::fs::File;
+use std::io::Cursor;
 use std::io::Stdout;
 use std::io::Write;
+use std::path::Path;
 use std::process;
 use std::process::Command;
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use symbolic::debuginfo::ObjectDebugSession;
-use symbolic::debuginfo::SymbolMap;
+use symbolic::debuginfo::dwarf::Dwarf;
+use symbolic::symcache::SymCache;
+use symbolic::symcache::SymCacheWriter;
 use tokio::runtime;
 use tokio::signal;
 use tracing::{error, Level};
@@ -28,6 +31,8 @@ use redbpf::{BpfStackFrames, StackTrace};
 use symbolic::common::{ByteView, Language, Name, NameMangling};
 use symbolic::debuginfo::{Function, Object};
 use symbolic::demangle::{Demangle, DemangleOptions};
+
+mod syms;
 
 use probes::malloc::MallocEvent;
 
@@ -128,20 +133,24 @@ fn main() {
 
     let view = ByteView::open("/home/oskar/Desktop/helix/target/debug/hx").unwrap();
     let object = Object::parse(&view).unwrap();
+    let test = Cursor::new(Vec::new());
+    let writer = SymCacheWriter::write_object(&object, test).unwrap();
+    let test = writer.into_inner();
+    {
+        let binary = BinaryObjectInfo::load(&object, pid, &test).unwrap();
 
-    let binary = BinaryObjectInfo::load(&object, pid).unwrap();
+        let mut cache = HashMap::new();
+        let stdout = std::io::stdout();
 
-    let mut cache = HashMap::new();
-    let stdout = std::io::stdout();
-
-    for alloc_size in acc.values() {
-        println!(
-            "{} bytes allocated, malloc called {} times at:",
-            alloc_size.size, alloc_size.count
-        );
-        binary
-            .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout)
-            .unwrap();
+        for alloc_size in acc.values() {
+            println!(
+                "{} bytes allocated, malloc called {} times at:",
+                alloc_size.size, alloc_size.count
+            );
+            binary
+                .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout)
+                .unwrap();
+        }
     }
 }
 
@@ -249,30 +258,31 @@ struct ParsedModule {
 impl ParsedModule {
     // from str
     fn parse(line: &str) -> Option<Self> {
-        let mut components = line.split(' ');
+        let mut components = line.split_whitespace();
         let (start_addr, end_addr) = components.next().and_then(|c| c.split_once("-"))?;
-        let (start_addr, end_addr) = (
+        let (start_addr, end_addr) = dbg!((
             u64::from_str_radix(start_addr, 16).ok()?,
             u64::from_str_radix(end_addr, 16).ok()?,
-        );
+        ));
 
-        if components.next().map(|c| c.contains('x')).unwrap_or(false) {
+        if !components.next().map(|c| c.contains('x')).unwrap_or(false) {
             // not an executable page ignore it
             return None;
         }
 
-        let file_offset = components
+        let file_offset = dbg!(components
             .next()
-            .and_then(|c| u64::from_str_radix(c, 16).ok())?;
+            .and_then(|c| u64::from_str_radix(c, 16).ok())?);
         // Skip dev version
-        components.next()?;
-        let inode = components.next().and_then(|c| c.parse().ok())?;
-        let name = components.next()?.to_string();
+        dbg!(components.next()?);
+        let inode = dbg!(components.next().and_then(|c| c.parse().ok())?);
+        let name = dbg!(components.next()?.to_string());
 
         if !is_mapping_file_backed(&name) {
             return None;
         }
 
+        println!("Parsed: {name}");
         // TODO: memfd
 
         Some(ParsedModule {
@@ -295,18 +305,35 @@ fn is_mapping_file_backed(name: &str) -> bool {
         && name.starts_with("[vsyscall]"))
 }
 
-struct Symbol {
+enum SymName {
+    NameIdx {
+        section_idx: usize,
+        str_table_idx: usize,
+        str_len: usize,
+        debug_file: bool,
+    },
+    Name(String),
+}
 
+struct Symbol {
+    is_name_resolved: bool,
+    start: u64,
+    size: u64,
+    data: SymName,
 }
 
 enum ModuleType {
-    UNKNOWN,
-    EXEC,
-    SO,
-    PERF_MAP,
-    VDSO,
+    Unknown,
+    Exec,
+    So {
+        elf_so_offset: u64,
+        elf_so_addr: u64,
+    },
+    // PERF_MAP,
+    Vdso,
 }
 
+#[derive(Debug)]
 struct Range {
     start: u64,
     end: u64,
@@ -319,22 +346,63 @@ struct Module {
     ranges: Vec<Range>,
     loaded: bool,
     module_type: ModuleType,
-    elf_so_offset: u64, // part of the enum
-    elf_so_addr: u64, 
     sym_names: HashSet<String>,
     syms: Vec<Symbol>,
 }
 
+impl Module {
+    fn new(name: String, path: String) -> Self {
+        let module_type = get_module_type(&path);
+        Self {
+            name,
+            path,
+            ranges: Default::default(),
+            loaded: false,
+            module_type,
+            sym_names: Default::default(),
+            syms: Default::default(),
+        }
+    }
+
+    fn contains(&self, addr: u64) -> Option<u64> {
+        //       dbg!(addr);
+        for range in self.ranges.iter() {
+            //            dbg!(range);
+            if addr >= range.start && addr < range.end {
+                let offset = range.start + range.offset;
+                match self.module_type {
+                    ModuleType::So {
+                        elf_so_offset,
+                        elf_so_addr,
+                    } => return Some(offset + (elf_so_addr - elf_so_offset)),
+                    ModuleType::Vdso => return Some(offset),
+                    _ => return Some(addr),
+                }
+            }
+        }
+        None
+    }
+}
+
 struct ProcSyms {
+    pid: i32,
     modules: Vec<Module>,
 }
 
 impl ProcSyms {
-    fn load_modules(pid: i32) -> Self {
+    fn new(pid: i32) -> Self {
+        Self {
+            pid,
+            modules: Vec::new(),
+        }
+    }
+
+    fn load_modules(&mut self) {
         use std::io::Read;
         let mut buf = String::new();
+        let pid = self.pid;
         // bcc_for_each_module ish,
-        let memory_maps = File::options()
+        File::options()
             .read(true)
             .open(format!("/proc/{pid}/maps"))
             .unwrap()
@@ -342,19 +410,78 @@ impl ProcSyms {
             .unwrap();
 
         // _procfs_maps_each_module
-        let parsed_modules = buf.lines().map(|line| ParsedModule::parse(line).unwrap());
-        Self { modules }
+        for parsed_module in buf.lines().filter_map(ParsedModule::parse) {
+            self.add_module(parsed_module);
+        }
+    }
+
+    fn add_module(&mut self, parse_module: ParsedModule) {
+        // check enter_ns which depends if module is perfmap which we ignore for now
+        //let modpath = format!("/proc/{}/root{}", self.pid, parse_module.name);
+        let modpath = parse_module.name.to_string();
+        println!("Adding: {modpath}");
+
+        if let Some(module) = self
+            .modules
+            .iter_mut()
+            .find(|module| module.name == parse_module.name)
+        {
+            module.ranges.push(Range {
+                start: parse_module.start_addr,
+                end: parse_module.end_addr,
+                offset: parse_module.file_offset,
+            });
+        } else {
+            let range = Range {
+                start: parse_module.start_addr,
+                end: parse_module.end_addr,
+                offset: parse_module.file_offset,
+            };
+            let mut module = Module::new(parse_module.name, modpath);
+            module.ranges.push(range);
+
+            self.modules.push(module);
+            // construct new module etc
+            // TRY to use the proc maps offset and read using symbolic first
+        }
     }
 }
 
-struct BinaryObjectInfo<'a> {
-    proc_memory_maps: BTreeMap<u64, String>,
-    debug_session: ObjectDebugSession<'a>,
-    symbol_map: SymbolMap<'a>,
+fn get_module_type(modpath: &str) -> ModuleType {
+    println!("Loading {modpath}");
+    if let std::result::Result::Ok(buffer) = std::fs::read(Path::new(modpath)) {
+        if let std::result::Result::Ok(Object::Elf(elf)) = Object::parse(&buffer) {
+            // Kind is doing stuff I might not want to do
+            return match dbg!(elf.kind()) {
+                symbolic::debuginfo::ObjectKind::Executable => ModuleType::Exec,
+                symbolic::debuginfo::ObjectKind::Library => {
+                    if let Some(text_section) = elf.section("text") {
+                        ModuleType::So {
+                            elf_so_offset: text_section.offset,
+                            elf_so_addr: text_section.address,
+                        }
+                    } else {
+                        panic!("Failed to find  text section");
+                    }
+                }
+                _ => ModuleType::Unknown,
+            };
+        }
+        ModuleType::Unknown
+    } else if modpath.contains("[vdso]") {
+        ModuleType::Vdso
+    } else {
+        ModuleType::Unknown
+    }
 }
 
-impl<'a> BinaryObjectInfo<'a> {
-    fn load(object: &Object<'a>, pid: i32) -> Result<Self> {
+struct BinaryObjectInfo<'b> {
+    proc_syms: ProcSyms,
+    symcache: SymCache<'b>,
+}
+
+impl<'b> BinaryObjectInfo<'b> {
+    fn load<'a: 'b>(object: &Object<'a>, pid: i32, test: &'b [u8]) -> Result<Self> {
         assert!(
             object.has_symbols(),
             "The given executable is missing symbols"
@@ -364,19 +491,33 @@ impl<'a> BinaryObjectInfo<'a> {
             "The given executable is missing debug info"
         );
 
-        println!("Loading symbols...");
+      /*  println!("Loading symbols...");
         let debug_session = object
             .debug_session()
-            .context("Failed to process executable file")?;
-        let symbol_map = object.symbol_map();
-        println!("Fetching proc memory map");
-        let proc_memory_maps = proc_memory_maps(pid)?;
+            .context("Failed to process executable file")?;*/
 
+        //let symbol_map = object.symbol_map();
+        println!("Fetching proc memory map");
+        //let proc_memory_maps = proc_memory_maps(pid)?;
+        let mut proc_syms = ProcSyms::new(pid);
+        proc_syms.load_modules();
+
+        let symcache = SymCache::parse(test).unwrap();
         Ok(BinaryObjectInfo {
-            proc_memory_maps,
-            debug_session,
-            symbol_map,
+            proc_syms,
+            //symbol_map,
+            symcache,
+            //symbuffer: &symbuffer,
         })
+    }
+
+    fn find_module_offset(&self, addr: u64) -> Option<(u64, &Module)> {
+        for module in self.proc_syms.modules.iter() {
+            if let Some(offset) = module.contains(addr) {
+                return Some((offset, module));
+            }
+        }
+        None
     }
 
     fn addr_to_line(
@@ -387,70 +528,64 @@ impl<'a> BinaryObjectInfo<'a> {
     ) -> Result<()> {
         let functions = true;
         let mut stdout = stdout.lock();
-        'addrs: for addr in addrs {
-            if *addr == 0x0 {
+        'addrs: for  addr in addrs.iter() {
+            let addr = *addr; //- 0x55c7d8e75040;
+            if addr == 0x0 {
                 continue;
             }
-            if let Some(cached) = cache.get(addr) {
+            if let Some(cached) = cache.get(&addr) {
                 writeln!(stdout, "Cached: {cached}").unwrap();
                 continue;
             }
             // Find memory region and convert virtual to address within binary
-            let (offset_addr, name) = match self.proc_memory_maps.range(..=addr).last() {
-                Some((offset, name)) => (*addr - *offset, name.clone()),
-                None => {
-                    writeln!(stdout, "Failed to find region for: {addr:x}").unwrap();
-                    (*addr, "unknown".to_owned())
-                }
-            };
-            for function in self.debug_session.functions() {
-                let function = function.context("Failed to read function")?;
-                if let Some(resolved) = resolve(&function, offset_addr, functions)? {
-                    writeln!(stdout, "{resolved}").unwrap();
-                    cache.insert(*addr, resolved);
-                    continue 'addrs;
-                }
-            }
-
-            if functions {
-                let addr = *addr; //- 0x55c7d8e75040;
-                if let Some(symbol) = self.symbol_map.lookup(addr) {
-                    if let Some(symbol_name) = &symbol.name {
-                        let symbol_name = Name::new(
-                            symbol_name.as_ref(),
-                            NameMangling::Mangled,
-                            Language::Unknown,
-                        );
-                        let resolved_name = print_name(Some(&symbol_name), false);
-                        cache.insert(addr, resolved_name.to_string());
-                        let range = print_range(symbol.address, Some(symbol.size), true);
-                        writeln!(stdout, "{resolved_name}\n at {range} in {name}",).unwrap();
+            if let Some((module_offset, module)) = self.find_module_offset(addr) {
+                let offset_addr = addr - module_offset;
+                /*writeln!(
+                    stdout,
+                    "Found {module_offset:x} for {addr:x} resulting in {:x} in module {}",
+                    offset_addr, module.name
+                )
+                .unwrap();*/
+                /*for function in self.debug_session.functions() {
+                    let function = function.context("Failed to read function")?;
+                    if let Some(resolved) = resolve(&function, offset_addr, functions)? {
+                        writeln!(stdout, "{resolved}").unwrap();
+                        cache.insert(addr, resolved);
+                        continue 'addrs;
                     }
-                } else {
-                    // TEMP
-                    /*println!("Addr: {addr:x}, offset: {offset_addr:x}");
-                    let mut sorted: Vec<(usize, u64)> = self
-                        .symbol_map
-                        .iter()
-                        .enumerate()
-                        .map(|(i, sym)| {
-                            (i, i64::abs(sym.address as i64 - offset_addr as i64) as u64)
-                        })
-                        .collect();
-                    sorted.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
-                    let closest_symbol = self.symbol_map[sorted.first().unwrap().0].address;
-                    println!("Closest symbol for addr: {addr:x} is at: {closest_symbol:x}");*/
-                    match self.proc_memory_maps.range(..=addr).last() {
-                        Some((offset, name)) => {
-                            println!("Region: {name} at {offset:x}");
+                }*/
+
+                if functions {
+                    if let std::result::Result::Ok(mut res) = self.symcache.lookup(offset_addr) {
+                        while let Some(std::result::Result::Ok(symbol)) = res.next() {
+                            let symbol_name = symbol.function_name();
+                            //if let Some(symbol_name) = &symbol.function_name() {
+                            /* let symbol_name = Name::new(
+                                symbol_name.as_ref(),
+                                NameMangling::Mangled,
+                                Language::Unknown,
+                            );*/
+                            let resolved_name = print_name(Some(&symbol_name), false);
+                            cache.insert(addr, resolved_name.to_string());
+                            //let range = print_range(symbol.function_address(), Some(symbol_name.), true);
+                            //writeln!(stdout, "{resolved_name}\n at {range} in {}", module.name)
+                            writeln!(stdout, "{resolved_name}\n at unknown in {}", module.name)
+                                .unwrap();
+                            //}
                         }
-                        None => {
-                            println!("Failed to find region for: {addr:x}");
-                        }
-                    };
-                    println!("Addr: {addr:x}, offset: {offset_addr:x}");
-                    println!("??:0");
+                    } else {
+                        writeln!(
+                            stdout,
+                            "Failed to find symbol: {addr:x}, offset: {offset_addr:x}"
+                        )
+                        .unwrap();
+                        println!("??:0");
+                    }
                 }
+            } else {
+                writeln!(stdout, "Failed to find module for {addr:x}").unwrap();
+                writeln!(stdout, "??:0").unwrap();
+                continue;
             }
         }
         Ok(())

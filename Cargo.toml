@@ -19,5 +19,6 @@ redbpf = { version = "2.3.0", features = ["load"] }
 futures = "0.3"
 tracing = "0.1.26"
 tracing-subscriber = "0.3.3"
-symbolic = { version = "8.5", features = ["demangle"] }
+symbolic = { version = "8.5", features = ["demangle", "symcache"] }
 anyhow = "1"
+#goblin = "0.4.3"
