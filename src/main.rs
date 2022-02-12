@@ -29,6 +29,7 @@ use symbolic::debuginfo::{Function, Object};
 use symbolic::demangle::{Demangle, DemangleOptions};
 
 mod syms;
+mod elf;
 
 use probes::malloc::MallocEvent;
 

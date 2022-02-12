@@ -1,6 +1,6 @@
-use std::{collections::HashSet, path::Path, fs::File};
+use std::{collections::HashSet, path::Path, fs::File, borrow::Cow};
 
-use symbolic::debuginfo::{dwarf::Dwarf, Object};
+use symbolic::debuginfo::{dwarf::Dwarf, Object, elf::ElfObject};
 
 pub struct ParsedModule {
     start_addr: u64,
@@ -78,6 +78,12 @@ pub struct Symbol {
     data: SymName,
 }
 
+pub struct TestSymbol<'data> {
+    name: Option<Cow<'data, str>>,
+    address: u64,
+    size: u64,
+}
+
 pub enum ModuleType {
     Unknown,
     Exec,
@@ -143,6 +149,10 @@ impl Module {
 pub struct ProcSyms {
     pub pid: i32,
     pub modules: Vec<Module>,
+}
+    
+fn find_debug_file_via_symfs(path: &str, elf: ElfObject<'_>)  {
+    // TODO
 }
 
 impl ProcSyms {
