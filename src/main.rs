@@ -6,15 +6,12 @@ use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::env;
-use std::io::Cursor;
 use std::io::Stdout;
 use std::io::Write;
 use std::process;
 use std::ptr;
 use std::result::Result::Ok;
 use std::sync::{Arc, Mutex};
-use symbolic::symcache::SymCache;
-use symbolic::symcache::SymCacheWriter;
 use syms::Module;
 use tokio::runtime;
 use tokio::signal;
@@ -25,11 +22,10 @@ use redbpf::load::{Loaded, Loader};
 use redbpf::{BpfStackFrames, StackTrace};
 
 use symbolic::common::{ByteView, Name};
-use symbolic::debuginfo::{Function, Object};
 use symbolic::demangle::{Demangle, DemangleOptions};
 
-mod syms;
 mod elf;
+mod syms;
 
 use probes::malloc::MallocEvent;
 
@@ -130,30 +126,23 @@ fn main() {
 
     let acc = acc.lock().unwrap();
 
-    let view = ByteView::open("/home/oskar/Desktop/helix/target/debug/hx").unwrap();
-    let object = Object::parse(&view).unwrap();
-    let test = Cursor::new(Vec::new());
-    let writer = SymCacheWriter::write_object(&object, test).unwrap();
-    let test = writer.into_inner();
-    {
-        let binary = BinaryObjectInfo::load(&object, pid, &test).unwrap();
+    let mut binary = BinaryObjectInfo::load(pid).unwrap();
 
-        let mut cache = AHashMap::new();
-        let stdout = std::io::stdout();
+    let mut cache = AHashMap::new();
+    let stdout = std::io::stdout();
 
-        let start = std::time::Instant::now();
-        for alloc_size in acc.values() {
-            println!(
-                "{} bytes allocated, malloc called {} times at:",
-                alloc_size.size, alloc_size.count
-            );
-            binary
-                .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout)
-                .unwrap();
-        }
-        let duration = start.elapsed().as_millis();
-        println!("Time taken {duration}")
+    let start = std::time::Instant::now();
+    for alloc_size in acc.values() {
+        println!(
+            "{} bytes allocated, malloc called {} times at:",
+            alloc_size.size, alloc_size.count
+        );
+        binary
+            .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout)
+            .unwrap();
     }
+    let duration = start.elapsed().as_millis();
+    println!("Time taken {duration}")
 }
 
 fn probe_code() -> &'static [u8] {
@@ -172,81 +161,25 @@ fn print_name<'a, N: Borrow<Name<'a>>>(name: Option<&'a N>, demangle: bool) -> C
     }
 }
 
-
-fn resolve<'a>(function: &'a Function<'_>, addr: u64, functions: bool) -> Result<Option<String>> {
-    if function.address > addr || function.address + function.size <= addr {
-        return Ok(None);
-    }
-
-    let mut result = String::default();
-
-    if true {
-        for il in &function.inlinees {
-            if let Some(resolved) = resolve(il, addr, functions)? {
-                result.push_str(&resolved);
-            }
-        }
-    }
-
-    for line in &function.lines {
-        if line.address + line.size.unwrap_or(1) <= addr {
-            continue;
-        } else if line.address > addr {
-            break;
-        }
-
-        if functions {
-            result.push_str(&print_name(Some(&function.name), true));
-            //result.push_str(&print_range(function.address, Some(function.size), true));
-            result.push_str("\n  at ");
-        }
-        // basenames?
-        let file = if false {
-            line.file.name_str()
-        } else {
-            line.file.path_str().into()
-        };
-        result.push_str(&format!("{}:{}", file, line.line));
-        //result.push_str(&print_range(line.address, line.size, true));
-        result.push('\n');
-
-        return Ok(Some(result));
-    }
-
-    Ok(None)
-}
-
-struct BinaryObjectInfo<'b> {
+struct BinaryObjectInfo {
     proc_syms: ProcSyms,
-    symcache: SymCache<'b>,
 }
 
-impl<'b> BinaryObjectInfo<'b> {
-    fn load<'a: 'b>(object: &Object<'a>, pid: i32, test: &'b [u8]) -> Result<Self> {
-        assert!(
-            object.has_symbols(),
-            "The given executable is missing symbols"
-        );
-        assert!(
-            object.has_debug_info(),
-            "The given executable is missing debug info"
-        );
-
+impl BinaryObjectInfo {
+    fn load(pid: i32) -> Result<Self> {
         println!("Fetching proc memory map");
         let mut proc_syms = ProcSyms::new(pid);
         proc_syms.load_modules();
 
-        let symcache = SymCache::parse(test).unwrap();
         Ok(BinaryObjectInfo {
             proc_syms,
             //symbol_map,
-            symcache,
             //symbuffer: &symbuffer,
         })
     }
 
-    fn find_module_offset(&self, addr: u64) -> Option<(u64, &Module)> {
-        for module in self.proc_syms.modules.iter() {
+    fn find_module_offset(&mut self, addr: u64) -> Option<(u64, &mut Module)> {
+        for module in self.proc_syms.modules.iter_mut() {
             if let Some(offset) = module.contains(addr) {
                 return Some((offset, module));
             }
@@ -255,7 +188,7 @@ impl<'b> BinaryObjectInfo<'b> {
     }
 
     fn addr_to_line(
-        &self,
+        &mut self,
         addrs: &[u64],
         cache: &mut AHashMap<u64, String>,
         stdout: &Stdout,
@@ -273,8 +206,53 @@ impl<'b> BinaryObjectInfo<'b> {
             // Find memory region and convert virtual to address within binary
             if let Some((module_offset, module)) = self.find_module_offset(addr) {
                 let offset_addr = addr - module_offset;
+                module.load_sym_table();
+                match module
+                    .syms
+                    .binary_search_by(|a| a.address.cmp(&offset_addr))
+                {
+                    Ok(index) => {
+                        let symbol = module.syms.get(index).unwrap();
+                        let symbol = symbol.name.as_ref().unwrap().clone();
+                        let name = Name::new(
+                            symbol,
+                            symbolic::common::NameMangling::Unknown,
+                            symbolic::common::Language::Unknown,
+                        );
+                        writeln!(stdout, "Found {offset_addr:x}").unwrap();
+                        let name = print_name(Some(&name), true);
+                        writeln!(stdout, "{name}").unwrap();
+                    }
+                    Err(index) => {
+                        if let Some(symbol) = module.syms.get(index - 1) {
+                            let symbol = symbol.name.as_ref().unwrap().clone();
+                            let name = Name::new(
+                                symbol,
+                                symbolic::common::NameMangling::Unknown,
+                                symbolic::common::Language::Unknown,
+                            );
+                            writeln!(stdout, "Found - 1 {offset_addr:x} in {}", module.path)
+                                .unwrap();
+                            let name = print_name(Some(&name), true);
+                            writeln!(stdout, "{name}").unwrap();
+                        }
+
+                        if let Some(sym) = module.syms.get(index + 1) {
+                            let symbol = sym.name.as_ref().unwrap().clone();
+                            let name = Name::new(
+                                symbol,
+                                symbolic::common::NameMangling::Unknown,
+                                symbolic::common::Language::Unknown,
+                            );
+                            writeln!(stdout, "Found + 1 {offset_addr:x} in {}", module.path)
+                                .unwrap();
+                            let name = print_name(Some(&name), true);
+                            writeln!(stdout, "{name}").unwrap();
+                        }
+                    }
+                }
                 // make it peekable
-                if let Ok(mut lookup_result) = self.symcache.lookup(offset_addr) {
+                /* if let Ok(mut lookup_result) = self.symcache.lookup(offset_addr) {
                     let mut found = false;
                     while let Some(Ok(symbol)) = lookup_result.next() {
                         let symbol_name = symbol.function_name();
@@ -303,7 +281,7 @@ impl<'b> BinaryObjectInfo<'b> {
                     )
                     .unwrap();
                     println!("??:0");
-                }
+                }*/
             } else {
                 writeln!(stdout, "Failed to find module for {addr:x}").unwrap();
                 writeln!(stdout, "??:0").unwrap();

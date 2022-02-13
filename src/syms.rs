@@ -1,6 +1,6 @@
-use std::{collections::HashSet, path::Path, fs::File, borrow::Cow};
+use std::{borrow::Cow, collections::HashSet, fs::File, path::Path};
 
-use symbolic::debuginfo::{dwarf::Dwarf, Object, elf::ElfObject};
+use crate::elf::ElfObject;
 
 pub struct ParsedModule {
     start_addr: u64,
@@ -16,23 +16,23 @@ impl ParsedModule {
     fn parse(line: &str) -> Option<Self> {
         let mut components = line.split_whitespace();
         let (start_addr, end_addr) = components.next().and_then(|c| c.split_once("-"))?;
-        let (start_addr, end_addr) = dbg!((
+        let (start_addr, end_addr) = (
             u64::from_str_radix(start_addr, 16).ok()?,
             u64::from_str_radix(end_addr, 16).ok()?,
-        ));
+        );
 
         if !components.next().map(|c| c.contains('x')).unwrap_or(false) {
             // not an executable page ignore it
             return None;
         }
 
-        let file_offset = dbg!(components
+        let file_offset = components
             .next()
-            .and_then(|c| u64::from_str_radix(c, 16).ok())?);
+            .and_then(|c| u64::from_str_radix(c, 16).ok())?;
         // Skip dev version
-        dbg!(components.next()?);
-        let inode = dbg!(components.next().and_then(|c| c.parse().ok())?);
-        let name = dbg!(components.next()?.to_string());
+        components.next()?;
+        let inode = components.next().and_then(|c| c.parse().ok())?;
+        let name = components.next()?.to_string();
 
         if !is_mapping_file_backed(&name) {
             return None;
@@ -78,12 +78,14 @@ pub struct Symbol {
     data: SymName,
 }
 
-pub struct TestSymbol<'data> {
-    name: Option<Cow<'data, str>>,
-    address: u64,
-    size: u64,
+#[derive(Debug, Clone)]
+pub struct TestSymbol {
+    pub name: Option<String>,
+    pub address: u64,
+    pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleType {
     Unknown,
     Exec,
@@ -91,8 +93,9 @@ pub enum ModuleType {
         elf_so_offset: u64,
         elf_so_addr: u64,
     },
-    // PERF_MAP,
+    PerfMap,
     Vdso,
+    Debug,
 }
 
 #[derive(Debug)]
@@ -109,7 +112,7 @@ pub struct Module {
     pub loaded: bool,
     pub module_type: ModuleType,
     pub sym_names: HashSet<String>,
-    pub syms: Vec<Symbol>,
+    pub syms: Vec<TestSymbol>,
 }
 
 impl Module {
@@ -124,6 +127,30 @@ impl Module {
             sym_names: Default::default(),
             syms: Default::default(),
         }
+    }
+
+    pub fn load_sym_table(&mut self) {
+        if self.loaded {
+            return;
+        }
+
+        match self.module_type {
+            ModuleType::Unknown => {}
+            ModuleType::Exec => {
+                self.syms = for_each_sym_core(&self.path, false);
+                self.syms.sort_by(|a,b| a.address.cmp(&b.address));
+            }
+            ModuleType::So {
+                elf_so_offset,
+                elf_so_addr,
+            } => {
+                self.syms = for_each_sym_core(&self.path, false);
+                self.syms.sort_by(|a,b| a.address.cmp(&b.address));
+            },
+            ModuleType::Vdso => todo!(),
+            _ => todo!(),
+        }
+        self.loaded = true;
     }
 
     pub fn contains(&self, addr: u64) -> Option<u64> {
@@ -146,13 +173,77 @@ impl Module {
     }
 }
 
+fn for_each_sym_core(path: &str, is_debug_file: bool) -> Vec<TestSymbol> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    // bcc_for_each_module ish,
+    File::options()
+        .read(true)
+        .open(path)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+
+    let elf = ElfObject::parse(&buf).unwrap();
+    if !is_debug_file {
+        if let Some(debug_file) = find_debug_file(&elf, path) {
+            for_each_sym_core(&debug_file, true);
+        }
+    }
+
+    println!("Should list symbols!");
+    // THIS Could actually work with some tweaks
+    elf.symbols().collect()
+    //listsymbols(&elf, is_debug_file);
+}
+
+fn listsymbols(elf: &ElfObject, is_debug_file: bool) {
+
+}
+
+fn find_debug_file(elf: &ElfObject, path: &str) -> Option<String> {
+    if let Some(debug_file) = find_debug_file_via_symfs(elf, path) {
+        return Some(debug_file);
+    }
+    if let Some(debug_file) = find_debug_file_via_buildid(elf) {
+        return Some(debug_file);
+    }
+    println!("No debug file found {path}");
+    // TODO via debug link as well
+    None
+}
+
+fn find_debug_file_via_symfs(elf: &ElfObject, path: &str) -> Option<String> {
+    // TODO
+    //let build_id = elf.find_build_id();
+    //path.strip_prefix("/proc/").unwrap();
+    //let post_pid = path.find('/').unwrap();
+    //let ns_prefix_lengfpath[post_pid..].strip_prefix("/root/").unwrap();
+    // This seems releated to when you have separate folder for symbols which
+    // might be useful later on
+    None
+}
+
+fn find_debug_file_via_buildid(elf: &ElfObject) -> Option<String> {
+    let build_id = elf.find_build_id()?;
+    let tmp = build_id[1..].iter().map(|b| format!("{b:02x}")).collect::<String>();
+    println!("Build id {}", tmp);
+    let debug_file_path = format!(
+        "/usr/lib/debug/.build-id/{:x}/{}.debug",
+        build_id[0],
+        &tmp,
+    );
+    if std::fs::read(&debug_file_path).is_ok() {
+        println!("Debug file_path: {debug_file_path}");
+        Some(debug_file_path)
+    } else {
+        None
+    }
+}
+
 pub struct ProcSyms {
     pub pid: i32,
     pub modules: Vec<Module>,
-}
-    
-fn find_debug_file_via_symfs(path: &str, elf: ElfObject<'_>)  {
-    // TODO
 }
 
 impl ProcSyms {
@@ -216,22 +307,9 @@ impl ProcSyms {
 fn get_module_type(modpath: &str) -> ModuleType {
     println!("Loading {modpath}");
     if let std::result::Result::Ok(buffer) = std::fs::read(Path::new(modpath)) {
-        if let std::result::Result::Ok(Object::Elf(elf)) = Object::parse(&buffer) {
+        if let std::result::Result::Ok(elf) = ElfObject::parse(&buffer) {
             // Kind is doing stuff I might not want to do
-            return match dbg!(elf.kind()) {
-                symbolic::debuginfo::ObjectKind::Executable => ModuleType::Exec,
-                symbolic::debuginfo::ObjectKind::Library => {
-                    if let Some(text_section) = elf.section("text") {
-                        ModuleType::So {
-                            elf_so_offset: text_section.offset,
-                            elf_so_addr: text_section.address,
-                        }
-                    } else {
-                        panic!("Failed to find  text section");
-                    }
-                }
-                _ => ModuleType::Unknown,
-            };
+            return elf.kind();
         }
         ModuleType::Unknown
     } else if modpath.contains("[vdso]") {

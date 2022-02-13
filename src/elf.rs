@@ -1,10 +1,8 @@
 //! Support for the Executable and Linkable Format, used on Linux.
 
-use thiserror::Error;  
 use std::borrow::Cow;
-use std::convert::TryInto;
-use std::ffi::CStr;
 use std::fmt;
+use thiserror::Error;
 
 use core::cmp;
 use flate2::{Decompress, FlushDecompress};
@@ -25,6 +23,13 @@ const PAGE_SIZE: usize = 4096;
 
 const SHN_UNDEF: usize = elf::section_header::SHN_UNDEF as usize;
 const SHF_COMPRESSED: u64 = elf::section_header::SHF_COMPRESSED as u64;
+
+struct DwarfSection<'data> {
+    pub address: u64,
+    pub offset: u64,
+    pub align: u64,
+    pub data: Cow<'data, [u8]>,
+}
 
 /// This file follows the first MIPS 32 bit ABI
 #[allow(unused)]
@@ -129,15 +134,14 @@ impl<'data> ElfObject<'data> {
         Ok(nchain)
     }
 
-
     /// Tries to parse an ELF object from the given slice. Will return a partially parsed ELF object
     /// if at least the program and section headers can be parsed.
     pub fn parse(data: &'data [u8]) -> anyhow::Result<Self> {
-        let header =
-            elf::Elf::parse_header(data).map_err(|_| anyhow::format_err!("ELF header unreadable"))?;
+        let header = elf::Elf::parse_header(data)
+            .map_err(|_| anyhow::format_err!("ELF header unreadable"))?;
         // dummy Elf with only header
-        let mut obj =
-            elf::Elf::lazy_parse(header).map_err(|_| anyhow::format_err!("cannot parse ELF header"))?;
+        let mut obj = elf::Elf::lazy_parse(header)
+            .map_err(|_| anyhow::format_err!("cannot parse ELF header"))?;
 
         let ctx = Ctx {
             container: if obj.is_64 {
@@ -333,41 +337,44 @@ impl<'data> ElfObject<'data> {
         })
     }
 
-
-
     /// The binary's soname, if any.
     pub fn name(&self) -> Option<&'data str> {
         self.elf.soname
     }
 
-
-
     /// The kind of this object, as specified in the ELF header.
-    pub fn kind(&self) -> symbolic::debuginfo::ObjectKind {
-        use symbolic::debuginfo::ObjectKind;
+    pub fn kind(&self) -> ModuleType {
         let kind = match self.elf.header.e_type {
-            goblin::elf::header::ET_NONE => ObjectKind::None,
-            goblin::elf::header::ET_REL => ObjectKind::Relocatable,
-            goblin::elf::header::ET_EXEC => ObjectKind::Executable,
-            goblin::elf::header::ET_DYN => ObjectKind::Library,
-            goblin::elf::header::ET_CORE => ObjectKind::Dump,
-            _ => ObjectKind::Other,
+            goblin::elf::header::ET_NONE => ModuleType::Unknown,
+            goblin::elf::header::ET_REL => ModuleType::Unknown,
+            goblin::elf::header::ET_EXEC => ModuleType::Exec,
+            goblin::elf::header::ET_DYN => {
+                if let Some(text_section) = self.section("text") {
+                    return ModuleType::So {
+                        elf_so_offset: text_section.offset,
+                        elf_so_addr: text_section.address,
+                    };
+                }
+                panic!("Failed to find text section for lib");
+            }
+            goblin::elf::header::ET_CORE => ModuleType::Unknown,
+            _ => ModuleType::Unknown,
         };
 
         // When stripping debug information into a separate file with objcopy,
         // the eh_type field still reads ET_EXEC. However, the interpreter is
         // removed. Since an executable without interpreter does not make any
         // sense, we assume ``Debug`` in this case.
-        if kind == ObjectKind::Executable && self.elf.interpreter.is_none() {
-            return ObjectKind::Debug;
+        if kind == ModuleType::Exec && self.elf.interpreter.is_none() {
+            return ModuleType::Debug;
         }
 
         // The same happens for libraries. However, here we can only check for
         // a missing text section. If this still yields too many false positivies,
         // we will have to check either the size or offset of that section in
         // the future.
-        if kind == ObjectKind::Library && self.raw_section("text").is_none() {
-            return ObjectKind::Debug;
+        if matches!(kind, ModuleType::So { .. }) && self.raw_section("text").is_none() {
+            return ModuleType::Debug;
         }
 
         kind
@@ -415,17 +422,15 @@ impl<'data> ElfObject<'data> {
         }
     }
 
-
     /// Determines whether this object contains debug information.
-    pub fn has_debug_info(&self) -> bool {
-        self.has_section("debug_info")
-    }
-
+    //pub fn has_debug_info(&self) -> bool {
+    //    self.has_section("debug_info")
+    // }
 
     /// Determines whether this object contains stack unwinding information.
-    pub fn has_unwind_info(&self) -> bool {
-        self.has_section("eh_frame") || self.has_section("debug_frame")
-    }
+    // pub fn has_unwind_info(&self) -> bool {
+    //    self.has_section("eh_frame") || self.has_section("debug_frame")
+    // }
 
     /// Determines whether this object contains embedded source.
     pub fn has_sources(&self) -> bool {
@@ -477,7 +482,7 @@ impl<'data> ElfObject<'data> {
         Some(decompressed)
     }
 
-   pub fn section(&self, name: &str) -> Option<DwarfSection<'data>> {
+    pub fn section(&self, name: &str) -> Option<DwarfSection<'data>> {
         let (compressed, mut section) = self.find_section(name)?;
 
         if compressed {
@@ -577,7 +582,6 @@ impl<'data> ElfObject<'data> {
 
         None
     }
-
 }
 
 impl fmt::Debug for ElfObject<'_> {
@@ -585,16 +589,12 @@ impl fmt::Debug for ElfObject<'_> {
         f.debug_struct("ElfObject")
             .field("load_address", &format_args!("{:#x}", self.load_address()))
             .field("has_symbols", &self.has_symbols())
-            .field("has_debug_info", &self.has_debug_info())
-            .field("has_unwind_info", &self.has_unwind_info())
+            //        .field("has_debug_info", &self.has_debug_info())
+            //       .field("has_unwind_info", &self.has_unwind_info())
             .field("is_malformed", &self.is_malformed())
             .finish()
     }
 }
-
-
-
-
 
 /// An iterator over symbols in the ELF file.
 ///
@@ -609,7 +609,7 @@ pub struct ElfSymbolIterator<'data, 'object> {
 }
 
 impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
-    type Item = TestSymbol<'data>;
+    type Item = TestSymbol;
 
     fn next(&mut self) -> Option<Self::Item> {
         fn get_symbols<'data>(
@@ -617,7 +617,7 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
             strtab: &Strtab<'data>,
             load_addr: u64,
             sections: &[SectionHeader],
-        ) -> Option<TestSymbol<'data>> {
+        ) -> Option<TestSymbol> {
             for symbol in symbols {
                 // Only check for function symbols.
                 if symbol.st_type() != elf::sym::STT_FUNC {
@@ -638,9 +638,9 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
                 // We are only interested in symbols pointing into sections with executable flag.
                 if !section.map_or(false, |header| header.is_executable()) {
                     continue;
-                }
+                 }
 
-                let name = strtab.get_at(symbol.st_name).map(Cow::Borrowed);
+                let name = strtab.get_at(symbol.st_name).map(|s| s.to_owned());
 
                 return Some(TestSymbol {
                     name,
@@ -669,4 +669,3 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
         })
     }
 }
-
