@@ -1,6 +1,9 @@
 use std::{borrow::Cow, collections::HashSet, fs::File, path::Path};
 
-use goblin::elf64::section_header::{SHT_DYNSYM, SHT_SYMTAB};
+use goblin::{
+    elf,
+    elf64::section_header::{SHT_DYNSYM, SHT_SYMTAB},
+};
 
 use crate::elf::ElfObject;
 
@@ -137,9 +140,11 @@ impl Module {
         }
 
         match self.module_type {
-            ModuleType::Unknown => { println!("unknown module {}", self.name); }
+            ModuleType::Unknown => {
+                println!("unknown module {}", self.name);
+            }
             ModuleType::Exec => {
-                    for_each_sym_core(&mut self.sym_names, &mut self.syms, &self.path, false);
+                for_each_sym_core(&mut self.sym_names, &mut self.syms, &self.path, false);
                 self.syms.sort_by(|a, b| a.address.cmp(&b.address));
             }
             ModuleType::So {
@@ -164,7 +169,10 @@ impl Module {
                         elf_so_offset,
                         elf_so_addr,
                     } => return Some(offset + (elf_so_addr - elf_so_offset)),
-                    ModuleType::Vdso => return Some(offset),
+                    ModuleType::Vdso => {
+                        println!("VDSO not supported");
+                        return Some(offset)
+                    },
                     _ => return Some(addr),
                 }
             }
@@ -223,19 +231,23 @@ fn listsymbols(
             if section.data.len() % header_size != 0 {
                 panic!("weirdd");
             }
-            for i in 0..symcount {
-                if let Some(sym) = elf.elf.syms.get(i) {
-                    if sym.st_value == 0 {
-                        continue;
-                    }
-                    let name = elf.elf.strtab.get_at(sym.st_name).map(|s| s.to_owned());
-                    syms.push(TestSymbol {
-                        name,
-                        address: sym.st_value,
-                        size: sym.st_size,
-                    });
+            let symtab = elf::Symtab::parse(
+                &section.data,
+                header.sh_offset as usize,
+                symcount as usize,
+                elf.ctx,
+            )
+            .unwrap();
+            for sym in symtab.iter() {
+                if sym.st_value == 0 {
+                    continue;
                 }
-                // GET SYM
+                let name = elf.elf.strtab.get_at(sym.st_name).map(|s| s.to_owned());
+                syms.push(TestSymbol {
+                    name,
+                    address: sym.st_value,
+                    size: sym.st_size,
+                });
             }
         } else {
             println!("Failed to find section!");

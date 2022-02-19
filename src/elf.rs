@@ -69,6 +69,7 @@ pub struct ElfObject<'data> {
     pub elf: elf::Elf<'data>,
     data: &'data [u8],
     is_malformed: bool,
+    pub ctx: Ctx,
 }
 
 impl<'data> ElfObject<'data> {
@@ -166,6 +167,7 @@ impl<'data> ElfObject<'data> {
                         elf: obj,
                         data,
                         is_malformed: true,
+                        ctx,
                     });
                 }
             };
@@ -334,6 +336,7 @@ impl<'data> ElfObject<'data> {
             elf: obj,
             data,
             is_malformed: false,
+            ctx,
         })
     }
 

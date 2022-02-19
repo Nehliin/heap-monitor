@@ -260,37 +260,6 @@ impl BinaryObjectInfo {
                         .unwrap();
                     }
                 }
-                // make it peekable
-                /* if let Ok(mut lookup_result) = self.symcache.lookup(offset_addr) {
-                    let mut found = false;
-                    while let Some(Ok(symbol)) = lookup_result.next() {
-                        let symbol_name = symbol.function_name();
-                        let resolved_name = print_name(Some(&symbol_name), true);
-                        writeln!(stdout, "{resolved_name}\n at unknown in {}", module.name)
-                            .unwrap();
-                        cache.insert(addr, resolved_name.into_owned());
-                        found = true;
-                        //let range = print_range(symbol.function_address(), Some(symbol_name.), true);
-                        //writeln!(stdout, "{resolved_name}\n at {range} in {}", module.name)
-
-                        //}
-                    }
-                    if !found {
-                        writeln!(
-                            stdout,
-                            "FAILED TO FIND {offset_addr:x}\n at unknown in {}",
-                            module.name
-                        )
-                        .unwrap();
-                    }
-                } else {
-                    writeln!(
-                        stdout,
-                        "Failed to find symbol: {addr:x}, offset: {offset_addr:x}"
-                    )
-                    .unwrap();
-                    println!("??:0");
-                }*/
             } else {
                 writeln!(stdout, "Failed to find module for {addr:x}").unwrap();
                 writeln!(stdout, "??:0").unwrap();
