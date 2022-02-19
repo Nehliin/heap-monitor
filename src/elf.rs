@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use thiserror::Error;
 
 use core::cmp;
 use flate2::{Decompress, FlushDecompress};
@@ -16,10 +15,7 @@ use goblin::{
 };
 use scroll::Pread;
 
-use crate::syms::{ModuleType, TestSymbol};
-
-const UUID_SIZE: usize = 16;
-const PAGE_SIZE: usize = 4096;
+use crate::syms::{ModuleType, Symbol};
 
 const SHN_UNDEF: usize = elf::section_header::SHN_UNDEF as usize;
 const SHF_COMPRESSED: u64 = elf::section_header::SHF_COMPRESSED as u64;
@@ -34,35 +30,10 @@ pub struct DwarfSection<'data> {
 /// This file follows the first MIPS 32 bit ABI
 #[allow(unused)]
 const EF_MIPS_ABI_O32: u32 = 0x0000_1000;
-/// O32 ABI extended for 64-bit architecture.
-const EF_MIPS_ABI_O64: u32 = 0x0000_2000;
 /// EABI in 32 bit mode.
 #[allow(unused)]
 const EF_MIPS_ABI_EABI32: u32 = 0x0000_3000;
-/// EABI in 64 bit mode.
-const EF_MIPS_ABI_EABI64: u32 = 0x0000_4000;
 
-/// Any flag value that might indicate 64-bit MIPS.
-const MIPS_64_FLAGS: u32 = EF_MIPS_ABI_O64 | EF_MIPS_ABI_EABI64;
-
-/// An error when dealing with [`ElfObject`](struct.ElfObject.html).
-/*#[derive(Debug, Error)]
-#[error("invalid ELF file")]
-pub struct ElfError {
-    #[source]
-    source: Option<Box<dyn Error + Send + Sync + 'static>>,
-}*/
-
-/*impl ElfError {
-    /// Creates a new ELF error from an arbitrary error payload.
-    fn new<E>(source: E) -> Self
-    where
-        E: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let source = Some(source.into());
-        Self { source }
-    }
-}*/
 
 /// Executable and Linkable Format, used for executables and libraries on Linux.
 pub struct ElfObject<'data> {
@@ -207,6 +178,7 @@ impl<'data> ElfObject<'data> {
 
         obj.syms = elf::Symtab::default();
         obj.strtab = Strtab::default();
+        // TODO improve time complexity
         for shdr in &obj.section_headers {
             if shdr.sh_type as u32 == elf::section_header::SHT_SYMTAB {
                 let size = shdr.sh_entsize;
@@ -346,14 +318,18 @@ impl<'data> ElfObject<'data> {
     }
 
     /// The kind of this object, as specified in the ELF header.
-    pub fn kind(&self) -> ModuleType {
+    /// TODO FIXME
+    pub fn kind(self) -> ModuleType<'data> {
+        let has_interpreter = self.elf.interpreter.is_none();
+        let has_text_section = self.raw_section("text").is_none();
         let kind = match self.elf.header.e_type {
             goblin::elf::header::ET_NONE => ModuleType::Unknown,
             goblin::elf::header::ET_REL => ModuleType::Unknown,
-            goblin::elf::header::ET_EXEC => ModuleType::Exec,
+            goblin::elf::header::ET_EXEC => ModuleType::Exec { elf: self },
             goblin::elf::header::ET_DYN => {
                 if let Some(text_section) = self.section("text") {
                     return ModuleType::So {
+                        elf: self,
                         elf_so_offset: text_section.offset,
                         elf_so_addr: text_section.address,
                     };
@@ -368,7 +344,7 @@ impl<'data> ElfObject<'data> {
         // the eh_type field still reads ET_EXEC. However, the interpreter is
         // removed. Since an executable without interpreter does not make any
         // sense, we assume ``Debug`` in this case.
-        if kind == ModuleType::Exec && self.elf.interpreter.is_none() {
+        if matches!(kind, ModuleType::Exec { .. }) && has_interpreter {
             return ModuleType::Debug;
         }
 
@@ -376,7 +352,7 @@ impl<'data> ElfObject<'data> {
         // a missing text section. If this still yields too many false positivies,
         // we will have to check either the size or offset of that section in
         // the future.
-        if matches!(kind, ModuleType::So { .. }) && self.raw_section("text").is_none() {
+        if matches!(kind, ModuleType::So { .. }) && has_text_section {
             return ModuleType::Debug;
         }
 
@@ -652,7 +628,7 @@ pub struct ElfSymbolIterator<'data, 'object> {
 }
 
 impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
-    type Item = TestSymbol;
+    type Item = Symbol;
 
     fn next(&mut self) -> Option<Self::Item> {
         fn get_symbols<'data>(
@@ -660,10 +636,12 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
             strtab: &Strtab<'data>,
             load_addr: u64,
             sections: &[SectionHeader],
-        ) -> Option<TestSymbol> {
+        ) -> Option<Symbol> {
             for symbol in symbols {
                 // Only check for function symbols.
-                if symbol.st_type() != elf::sym::STT_FUNC {
+                if symbol.st_type() != elf::sym::STT_FUNC
+                    && symbol.st_type() != elf::sym::STT_GNU_IFUNC
+                {
                     continue;
                 }
 
@@ -685,9 +663,9 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
 
                 let name = strtab.get_at(symbol.st_name).map(|s| s.to_owned());
 
-                return Some(TestSymbol {
+                return Some(Symbol {
                     name,
-                    // This might not be what I want
+                    // This might not be what's correct 
                     address: symbol.st_value - load_addr,
                     size: symbol.st_size,
                 });

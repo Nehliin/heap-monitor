@@ -1,18 +1,11 @@
 use ahash::AHashMap;
-use anyhow::*;
 use clap::Parser;
 use futures::stream::StreamExt;
-use std::borrow::Borrow;
-use std::borrow::Cow;
 use std::boxed::Box;
 use std::env;
-use std::io::Stdout;
-use std::io::Write;
 use std::process;
 use std::ptr;
-use std::result::Result::Ok;
 use std::sync::{Arc, Mutex};
-use syms::Module;
 use tokio::runtime;
 use tokio::signal;
 use tracing::{error, Level};
@@ -21,15 +14,14 @@ use tracing_subscriber::FmtSubscriber;
 use redbpf::load::{Loaded, Loader};
 use redbpf::{BpfStackFrames, StackTrace};
 
-use symbolic::common::{ByteView, Name};
-use symbolic::demangle::{Demangle, DemangleOptions};
 
 mod elf;
 mod syms;
 
 use probes::malloc::MallocEvent;
 
-use crate::syms::ProcSyms;
+use crate::syms::SymLoader;
+
 
 struct AllocSize {
     size: u64,
@@ -126,7 +118,8 @@ fn main() {
 
     let acc = acc.lock().unwrap();
 
-    let mut binary = BinaryObjectInfo::load(pid).unwrap();
+    let mut symloader = SymLoader::new(pid);
+    let mut symbols = symloader.load_modules();
 
     let mut cache = AHashMap::new();
     let stdout = std::io::stdout();
@@ -137,9 +130,8 @@ fn main() {
             "{} bytes allocated, malloc called {} times at:",
             alloc_size.size, alloc_size.count
         );
-        binary
-            .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout)
-            .unwrap();
+       symbols 
+            .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout);
     }
     let duration = start.elapsed().as_millis();
     println!("Time taken {duration}")
@@ -152,120 +144,3 @@ fn probe_code() -> &'static [u8] {
     ))
 }
 
-fn print_name<'a, N: Borrow<Name<'a>>>(name: Option<&'a N>, demangle: bool) -> Cow<'a, str> {
-    match name.map(Borrow::borrow) {
-        None => Cow::Owned(String::from("??")),
-        Some(name) if name.as_str().is_empty() => Cow::Owned(String::from("??")),
-        Some(name) if demangle => name.try_demangle(DemangleOptions::name_only()),
-        Some(name) => Cow::Borrowed(name.as_str()),
-    }
-}
-
-struct BinaryObjectInfo {
-    proc_syms: ProcSyms,
-}
-
-impl BinaryObjectInfo {
-    fn load(pid: i32) -> Result<Self> {
-        println!("Fetching proc memory map");
-        let mut proc_syms = ProcSyms::new(pid);
-        proc_syms.load_modules();
-
-        Ok(BinaryObjectInfo {
-            proc_syms,
-            //symbol_map,
-            //symbuffer: &symbuffer,
-        })
-    }
-
-    fn find_module_offset(&mut self, addr: u64) -> Option<(u64, &mut Module)> {
-        for module in self.proc_syms.modules.iter_mut() {
-            if let Some(offset) = module.contains(addr) {
-                return Some((offset, module));
-            }
-        }
-        None
-    }
-
-    fn addr_to_line(
-        &mut self,
-        addrs: &[u64],
-        cache: &mut AHashMap<u64, String>,
-        stdout: &Stdout,
-    ) -> Result<()> {
-        let mut stdout = stdout.lock();
-        'addr: for addr in addrs.iter() {
-            let addr = *addr; //- 0x55c7d8e75040;
-            if addr == 0x0 {
-                continue;
-            }
-            if let Some(cached) = cache.get(&addr) {
-                writeln!(stdout, "Cached: {cached}").unwrap();
-                continue;
-            }
-            // Find memory region and convert virtual to address within binary
-            if let Some((module_offset, module)) = self.find_module_offset(addr) {
-                module.load_sym_table();
-                match module
-                    .syms
-                    .binary_search_by(|a| a.address.cmp(&module_offset))
-                {
-                    // TODO?
-                    Ok(index) => {
-                        let symbol = module.syms.get(index).unwrap();
-                        let symbol = symbol.name.as_ref().unwrap().clone();
-                        let name = Name::new(
-                            symbol,
-                            symbolic::common::NameMangling::Unknown,
-                            symbolic::common::Language::Unknown,
-                        );
-                        writeln!(stdout, "Found {module_offset:x}").unwrap();
-                        let name = print_name(Some(&name), true);
-                        writeln!(stdout, "{name}").unwrap();
-                        continue 'addr;
-                    }
-                    Err(index) => {
-                        let mut i = index - 1;
-                        let limit = module.syms.get(i).map(|s| s.address).unwrap_or(u64::MAX);
-                        while let Some(sym) = module.syms.get(i) {
-                            // keep going as long as we are larger than the sym addr
-                            if module_offset < sym.address {
-                                break;
-                            }
-                            // if the offset_addr is GREATER than addr but less than addr + size
-                            // it's a match
-                            if module_offset < sym.address + sym.size {
-                                // resolve here if done lazily
-                                let symbol = sym.name.as_ref().unwrap().clone();
-                                let name = Name::new(
-                                    symbol,
-                                    symbolic::common::NameMangling::Unknown,
-                                    symbolic::common::Language::Unknown,
-                                );
-                                //        writeln!(stdout, "Found {offset_addr:x}").unwrap();
-                                let name = print_name(Some(&name), true);
-                                writeln!(stdout, "{name}").unwrap();
-                                continue 'addr;
-                            }
-                            if limit > sym.address + sym.size {
-                                break;
-                            }
-                            i -= 1;
-                        }
-                        writeln!(
-                            stdout,
-                            "FAILED TO FIND {module_offset:x}\n at unknown in {}",
-                            module.name
-                        )
-                        .unwrap();
-                    }
-                }
-            } else {
-                writeln!(stdout, "Failed to find module for {addr:x}").unwrap();
-                writeln!(stdout, "??:0").unwrap();
-                continue;
-            }
-        }
-        Ok(())
-    }
-}
