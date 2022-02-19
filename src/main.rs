@@ -194,7 +194,7 @@ impl BinaryObjectInfo {
         stdout: &Stdout,
     ) -> Result<()> {
         let mut stdout = stdout.lock();
-        for addr in addrs.iter() {
+        'addr: for addr in addrs.iter() {
             let addr = *addr; //- 0x55c7d8e75040;
             if addr == 0x0 {
                 continue;
@@ -205,12 +205,12 @@ impl BinaryObjectInfo {
             }
             // Find memory region and convert virtual to address within binary
             if let Some((module_offset, module)) = self.find_module_offset(addr) {
-                let offset_addr = addr - module_offset;
                 module.load_sym_table();
                 match module
                     .syms
-                    .binary_search_by(|a| a.address.cmp(&offset_addr))
+                    .binary_search_by(|a| a.address.cmp(&module_offset))
                 {
+                    // TODO?
                     Ok(index) => {
                         let symbol = module.syms.get(index).unwrap();
                         let symbol = symbol.name.as_ref().unwrap().clone();
@@ -219,36 +219,45 @@ impl BinaryObjectInfo {
                             symbolic::common::NameMangling::Unknown,
                             symbolic::common::Language::Unknown,
                         );
-                        writeln!(stdout, "Found {offset_addr:x}").unwrap();
+                        writeln!(stdout, "Found {module_offset:x}").unwrap();
                         let name = print_name(Some(&name), true);
                         writeln!(stdout, "{name}").unwrap();
+                        continue 'addr;
                     }
                     Err(index) => {
-                        if let Some(symbol) = module.syms.get(index - 1) {
-                            let symbol = symbol.name.as_ref().unwrap().clone();
-                            let name = Name::new(
-                                symbol,
-                                symbolic::common::NameMangling::Unknown,
-                                symbolic::common::Language::Unknown,
-                            );
-                            writeln!(stdout, "Found - 1 {offset_addr:x} in {}", module.path)
-                                .unwrap();
-                            let name = print_name(Some(&name), true);
-                            writeln!(stdout, "{name}").unwrap();
+                        let mut i = index - 1;
+                        let limit = module.syms.get(i).map(|s| s.address).unwrap_or(u64::MAX);
+                        while let Some(sym) = module.syms.get(i) {
+                            // keep going as long as we are larger than the sym addr
+                            if module_offset < sym.address {
+                                break;
+                            }
+                            // if the offset_addr is GREATER than addr but less than addr + size
+                            // it's a match
+                            if module_offset < sym.address + sym.size {
+                                // resolve here if done lazily
+                                let symbol = sym.name.as_ref().unwrap().clone();
+                                let name = Name::new(
+                                    symbol,
+                                    symbolic::common::NameMangling::Unknown,
+                                    symbolic::common::Language::Unknown,
+                                );
+                                //        writeln!(stdout, "Found {offset_addr:x}").unwrap();
+                                let name = print_name(Some(&name), true);
+                                writeln!(stdout, "{name}").unwrap();
+                                continue 'addr;
+                            }
+                            if limit > sym.address + sym.size {
+                                break;
+                            }
+                            i -= 1;
                         }
-
-                        if let Some(sym) = module.syms.get(index + 1) {
-                            let symbol = sym.name.as_ref().unwrap().clone();
-                            let name = Name::new(
-                                symbol,
-                                symbolic::common::NameMangling::Unknown,
-                                symbolic::common::Language::Unknown,
-                            );
-                            writeln!(stdout, "Found + 1 {offset_addr:x} in {}", module.path)
-                                .unwrap();
-                            let name = print_name(Some(&name), true);
-                            writeln!(stdout, "{name}").unwrap();
-                        }
+                        writeln!(
+                            stdout,
+                            "FAILED TO FIND {module_offset:x}\n at unknown in {}",
+                            module.name
+                        )
+                        .unwrap();
                     }
                 }
                 // make it peekable

@@ -24,7 +24,7 @@ const PAGE_SIZE: usize = 4096;
 const SHN_UNDEF: usize = elf::section_header::SHN_UNDEF as usize;
 const SHF_COMPRESSED: u64 = elf::section_header::SHF_COMPRESSED as u64;
 
-struct DwarfSection<'data> {
+pub struct DwarfSection<'data> {
     pub address: u64,
     pub offset: u64,
     pub align: u64,
@@ -66,7 +66,7 @@ pub struct ElfError {
 
 /// Executable and Linkable Format, used for executables and libraries on Linux.
 pub struct ElfObject<'data> {
-    elf: elf::Elf<'data>,
+    pub elf: elf::Elf<'data>,
     data: &'data [u8],
     is_malformed: bool,
 }
@@ -448,7 +448,7 @@ impl<'data> ElfObject<'data> {
     }
 
     /// Decompresses the given compressed section data, if supported.
-    fn decompress_section(&self, section_data: &[u8]) -> Option<Vec<u8>> {
+    pub fn decompress_section(&self, section_data: &[u8]) -> Option<Vec<u8>> {
         let (size, compressed) = if section_data.starts_with(b"ZLIB") {
             // The GNU compression header is a 4 byte magic "ZLIB", followed by an 8-byte big-endian
             // size prefix of the decompressed data. This adds up to 12 bytes of GNU header.
@@ -496,6 +496,46 @@ impl<'data> ElfObject<'data> {
     pub fn raw_section(&self, name: &str) -> Option<DwarfSection<'data>> {
         let (_, section) = self.find_section(name)?;
         Some(section)
+    }
+
+    pub fn section_from_header(
+        &self,
+        header: &SectionHeader,
+    ) -> Option<(bool, DwarfSection<'data>)> {
+        // TODO
+        if let Some(section_name) = self.elf.shdr_strtab.get_at(header.sh_name) {
+            let offset = header.sh_offset as usize;
+            if offset == 0 {
+                // We're defensive here. On darwin, dsymutil leaves phantom section headers
+                // while stripping their data from the file by setting their offset to 0. We
+                // know that no section can start at an absolute file offset of zero, so we can
+                // safely skip them in case similar things happen on linux.
+                return None;
+            }
+
+            if section_name.is_empty() {
+                panic!("empty section name");
+            }
+
+            // Before SHF_COMPRESSED was a thing, compressed sections were prefixed with `.z`.
+            // Support this as an override to the flag.
+            let (compressed, section_name) = match section_name.strip_prefix(".z") {
+                Some(name) => (true, name),
+                None => (header.sh_flags & SHF_COMPRESSED != 0, &section_name[1..]),
+            };
+
+            let size = header.sh_size as usize;
+            let data = &self.data[offset..][..size];
+            let section = DwarfSection {
+                data: Cow::Borrowed(data),
+                address: header.sh_addr,
+                offset: header.sh_offset,
+                align: header.sh_addralign,
+            };
+
+            return Some((compressed, section));
+        }
+        None
     }
 
     /// Locates and reads a section in an ELF binary.
@@ -638,7 +678,7 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
                 // We are only interested in symbols pointing into sections with executable flag.
                 if !section.map_or(false, |header| header.is_executable()) {
                     continue;
-                 }
+                }
 
                 let name = strtab.get_at(symbol.st_name).map(|s| s.to_owned());
 

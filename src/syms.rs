@@ -1,5 +1,7 @@
 use std::{borrow::Cow, collections::HashSet, fs::File, path::Path};
 
+use goblin::elf64::section_header::{SHT_DYNSYM, SHT_SYMTAB};
+
 use crate::elf::ElfObject;
 
 pub struct ParsedModule {
@@ -135,18 +137,18 @@ impl Module {
         }
 
         match self.module_type {
-            ModuleType::Unknown => {}
+            ModuleType::Unknown => { println!("unknown module {}", self.name); }
             ModuleType::Exec => {
-                self.syms = for_each_sym_core(&self.path, false);
-                self.syms.sort_by(|a,b| a.address.cmp(&b.address));
+                    for_each_sym_core(&mut self.sym_names, &mut self.syms, &self.path, false);
+                self.syms.sort_by(|a, b| a.address.cmp(&b.address));
             }
             ModuleType::So {
                 elf_so_offset,
                 elf_so_addr,
             } => {
-                self.syms = for_each_sym_core(&self.path, false);
-                self.syms.sort_by(|a,b| a.address.cmp(&b.address));
-            },
+                for_each_sym_core(&mut self.sym_names, &mut self.syms, &self.path, false);
+                self.syms.sort_by(|a, b| a.address.cmp(&b.address));
+            }
             ModuleType::Vdso => todo!(),
             _ => todo!(),
         }
@@ -154,11 +156,9 @@ impl Module {
     }
 
     pub fn contains(&self, addr: u64) -> Option<u64> {
-        //       dbg!(addr);
         for range in self.ranges.iter() {
-            //            dbg!(range);
             if addr >= range.start && addr < range.end {
-                let offset = range.start + range.offset;
+                let offset = addr - range.start + range.offset;
                 match self.module_type {
                     ModuleType::So {
                         elf_so_offset,
@@ -173,7 +173,12 @@ impl Module {
     }
 }
 
-fn for_each_sym_core(path: &str, is_debug_file: bool) -> Vec<TestSymbol> {
+fn for_each_sym_core(
+    symnames: &mut HashSet<String>,
+    syms: &mut Vec<TestSymbol>,
+    path: &str,
+    is_debug_file: bool,
+) {
     use std::io::Read;
     let mut buf = Vec::new();
     // bcc_for_each_module ish,
@@ -187,18 +192,55 @@ fn for_each_sym_core(path: &str, is_debug_file: bool) -> Vec<TestSymbol> {
     let elf = ElfObject::parse(&buf).unwrap();
     if !is_debug_file {
         if let Some(debug_file) = find_debug_file(&elf, path) {
-            for_each_sym_core(&debug_file, true);
+            for_each_sym_core(symnames, syms, &debug_file, true);
         }
     }
 
     println!("Should list symbols!");
+    //listsymbols(symnames, syms, &elf, is_debug_file);
     // THIS Could actually work with some tweaks
-    elf.symbols().collect()
+    syms.extend(elf.symbols());
     //listsymbols(&elf, is_debug_file);
 }
 
-fn listsymbols(elf: &ElfObject, is_debug_file: bool) {
-
+fn listsymbols(
+    _symnames: &mut HashSet<String>,
+    syms: &mut Vec<TestSymbol>,
+    elf: &ElfObject,
+    _is_debug_file: bool,
+) {
+    for header in elf.elf.section_headers.iter() {
+        if header.sh_type != SHT_SYMTAB && header.sh_type != SHT_DYNSYM {
+            continue;
+        }
+        if let Some((compressed, mut section)) = elf.section_from_header(header) {
+            if compressed {
+                let decompressed = elf.decompress_section(&section.data).unwrap();
+                section.data = Cow::Owned(decompressed);
+            }
+            let header_size = header.sh_entsize as usize;
+            let symcount = section.data.len() / header_size;
+            if section.data.len() % header_size != 0 {
+                panic!("weirdd");
+            }
+            for i in 0..symcount {
+                if let Some(sym) = elf.elf.syms.get(i) {
+                    if sym.st_value == 0 {
+                        continue;
+                    }
+                    let name = elf.elf.strtab.get_at(sym.st_name).map(|s| s.to_owned());
+                    syms.push(TestSymbol {
+                        name,
+                        address: sym.st_value,
+                        size: sym.st_size,
+                    });
+                }
+                // GET SYM
+            }
+        } else {
+            println!("Failed to find section!");
+        }
+    }
 }
 
 fn find_debug_file(elf: &ElfObject, path: &str) -> Option<String> {
@@ -226,13 +268,12 @@ fn find_debug_file_via_symfs(elf: &ElfObject, path: &str) -> Option<String> {
 
 fn find_debug_file_via_buildid(elf: &ElfObject) -> Option<String> {
     let build_id = elf.find_build_id()?;
-    let tmp = build_id[1..].iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let tmp = build_id[1..]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     println!("Build id {}", tmp);
-    let debug_file_path = format!(
-        "/usr/lib/debug/.build-id/{:x}/{}.debug",
-        build_id[0],
-        &tmp,
-    );
+    let debug_file_path = format!("/usr/lib/debug/.build-id/{:x}/{}.debug", build_id[0], &tmp,);
     if std::fs::read(&debug_file_path).is_ok() {
         println!("Debug file_path: {debug_file_path}");
         Some(debug_file_path)
