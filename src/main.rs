@@ -1,19 +1,16 @@
 use ahash::AHashMap;
 use clap::Parser;
 use futures::stream::StreamExt;
-use std::boxed::Box;
 use std::env;
 use std::process;
 use std::ptr;
-use std::sync::{Arc, Mutex};
-use tokio::runtime;
 use tokio::signal;
+use tokio::sync::mpsc::Sender;
 use tracing::{error, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use redbpf::load::{Loaded, Loader};
 use redbpf::{BpfStackFrames, StackTrace};
-
 
 mod elf;
 mod syms;
@@ -22,46 +19,34 @@ use probes::malloc::MallocEvent;
 
 use crate::syms::SymLoader;
 
-
-struct AllocSize {
+struct Allocation {
+    stack_id: i64,
     size: u64,
-    count: u64,
     frames: BpfStackFrames,
 }
 
-type Acc = Arc<Mutex<AHashMap<i64, AllocSize>>>;
 
-fn handle_malloc_event(acc: Acc, loaded: &Loaded, event: Box<[u8]>) {
-    let mut acc = acc.lock().unwrap();
-    let mev = unsafe { ptr::read(event.as_ptr() as *const MallocEvent) };
-    if let Some(alloc_size) = acc.get_mut(&mev.stackid) {
-        (*alloc_size).size += mev.size;
-        (*alloc_size).count += 1;
-    } else {
-        let mut stack_trace = StackTrace::new(loaded.map("stack_trace").unwrap());
-        if let Some(frames) = stack_trace.get(mev.stackid) {
-            acc.insert(
-                mev.stackid,
-                AllocSize {
-                    size: mev.size,
-                    count: 1,
-                    frames,
-                },
-            );
-        }
-    }
-}
-
-fn start_perf_event_handler(mut loaded: Loaded, acc: Acc) {
+fn start_perf_event_handler(mut loaded: Loaded, sender: Sender<Allocation>) {
     tokio::spawn(async move {
         while let Some((name, events)) = loaded.events.next().await {
-            match name.as_str() {
-                "malloc_event" => {
-                    for event in events {
-                        handle_malloc_event(acc.clone(), &loaded, event);
+            if name.as_str() == "malloc_event" {
+                for event in events {
+                    let m_event = unsafe { ptr::read(event.as_ptr() as *const MallocEvent) };
+                    let mut stack_trace = StackTrace::new(loaded.map("stack_trace").unwrap());
+                    if let Some(frames) = stack_trace.get(m_event.stackid) {
+                        sender
+                            .send(Allocation {
+                                stack_id: m_event.stackid,
+                                size: m_event.size,
+                                frames,
+                            })
+                            .await
+                            .map_err(|_err| "Failed to send allocation event")
+                            .unwrap();
+                    } else {
+                        tracing::warn!("Stack trace not found for allocation: {}", m_event.stackid);
                     }
                 }
-                _ => {}
             }
         }
     });
@@ -81,7 +66,8 @@ struct Args {
     // raw addrs:bool
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::TRACE)
         .finish();
@@ -94,19 +80,16 @@ fn main() {
     let args = Args::parse();
     let pid = args.pid;
 
-    let acc: Acc = Arc::new(Mutex::new(AHashMap::new()));
-    let rt = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _ = rt.block_on(async {
+    let (tx, mut rc) = tokio::sync::mpsc::channel(512);
+
+    let event_handler = tokio::spawn(async move {
         let mut loaded = Loader::load(probe_code()).expect("error loading BPF program");
 
         for prb in loaded.uprobes_mut() {
-            prb.attach_uprobe(Some(&prb.name()), 0, "libc", Some(args.pid))
+            prb.attach_uprobe(Some(&prb.name()), 0, "libc", Some(pid))
                 .unwrap_or_else(|_| panic!("error attaching uprobe program {}", prb.name()));
         }
-        start_perf_event_handler(loaded, acc.clone());
+        start_perf_event_handler(loaded, tx);
 
         println!(
             "Attaching to malloc in PID {}, Hit Ctrl-C to quit!",
@@ -114,27 +97,25 @@ fn main() {
         );
         signal::ctrl_c().await
     });
-    println!();
 
-    let acc = acc.lock().unwrap();
+    tokio::spawn(async move {
+        let mut symloader = SymLoader::new(pid);
+        let mut symbols = symloader.load_modules();
 
-    let mut symloader = SymLoader::new(pid);
-    let mut symbols = symloader.load_modules();
+        let mut cache = AHashMap::new();
+        let stdout = std::io::stdout();
 
-    let mut cache = AHashMap::new();
-    let stdout = std::io::stdout();
+        let start = std::time::Instant::now();
+        
+        while let Some(allocation) = rc.recv().await {
+            symbols.addr_to_line(&allocation.frames.ip, &mut cache, &stdout);
+        }
+        
+        let duration = start.elapsed().as_millis();
+        println!("Time taken {duration}");
+    });
 
-    let start = std::time::Instant::now();
-    for alloc_size in acc.values() {
-        println!(
-            "{} bytes allocated, malloc called {} times at:",
-            alloc_size.size, alloc_size.count
-        );
-       symbols 
-            .addr_to_line(&alloc_size.frames.ip, &mut cache, &stdout);
-    }
-    let duration = start.elapsed().as_millis();
-    println!("Time taken {duration}")
+    let _ = event_handler.await.unwrap();
 }
 
 fn probe_code() -> &'static [u8] {
@@ -143,4 +124,3 @@ fn probe_code() -> &'static [u8] {
         "/target/bpf/programs/malloc/malloc.elf"
     ))
 }
-
