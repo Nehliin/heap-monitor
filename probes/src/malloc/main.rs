@@ -48,6 +48,38 @@ fn calloc(regs: Registers) {
 }
 
 #[uprobe]
+fn realloc(regs: Registers) {
+    let mut m_event = MallocEvent {
+        stackid: 0,
+        ptr: regs.parm1(),
+        size: regs.parm2(),
+    };
+
+    unsafe {
+        if let Ok(stackid) = stack_trace.stack_id(regs.ctx, BPF_F_USER_STACK as _) {
+            m_event.stackid = stackid;
+            malloc_event.insert(regs.ctx, &m_event);
+        }
+    }
+}
+
+#[uprobe]
+fn aligned_alloc(regs: Registers) {
+    let mut m_event = MallocEvent {
+        stackid: 0,
+        ptr: regs.ret(),
+        size: regs.parm2(),
+    };
+
+    unsafe {
+        if let Ok(stackid) = stack_trace.stack_id(regs.ctx, BPF_F_USER_STACK as _) {
+            m_event.stackid = stackid;
+            malloc_event.insert(regs.ctx, &m_event);
+        }
+    }
+}
+
+#[uprobe]
 fn free(regs: Registers) {
     let mut f_event = FreeEvent {
         ptr: regs.parm1(),
