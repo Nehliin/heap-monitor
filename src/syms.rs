@@ -356,7 +356,7 @@ impl<'data> Symbols<'data> {
     ) {
         let mut stdout = stdout.lock();
         'addr: for addr in addrs.iter() {
-            let addr = *addr; //- 0x55c7d8e75040;
+            let addr = *addr;
             if addr == 0x0 {
                 continue;
             }
