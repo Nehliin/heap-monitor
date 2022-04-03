@@ -78,6 +78,9 @@ struct Args {
     /// Pid of process to monitor
     #[clap(short, long)]
     pid: i32,
+    /// Sets the amount of stack traces to print out
+    #[clap(short, long, default_value_t = 10)]
+    traces: u32,
     /// Verbose tracing logs
     #[clap(short, long)]
     verbose: bool,
@@ -139,10 +142,10 @@ async fn main() {
                 .unwrap_or_else(|_| panic!("error attaching uprobe program {}", prb.name()));
         }
 
-        println!(
+        eprintln!(
             "{}",
             format!("Monitoring heap in PID {}, Hit Ctrl-C to quit!", args.pid)
-                .if_supports_color(owo_colors::Stream::Stdout, |text| text.green())
+                .if_supports_color(owo_colors::Stream::Stderr, |text| text.green())
         );
         tokio::select! {
             _ = signal::ctrl_c() => {},
@@ -205,9 +208,9 @@ async fn main() {
         let mut cache = AHashMap::new();
         let stdout = std::io::stdout();
 
-        println!(
+        eprintln!(
             "{}",
-            "Processing...".if_supports_color(owo_colors::Stream::Stdout, |text| text.yellow())
+            "Processing...".if_supports_color(owo_colors::Stream::Stderr, |text| text.yellow())
         );
         let start = std::time::Instant::now();
 
@@ -215,7 +218,7 @@ async fn main() {
             allocation_stats.into_iter().collect();
         largest_outstanding.sort_unstable_by(|(_, a), (_, b)| b.total_size.cmp(&a.total_size));
 
-        for (stack_id, alloc_stat) in largest_outstanding.iter().take(10) {
+        for (stack_id, alloc_stat) in largest_outstanding.iter().take(args.traces as usize) {
             if let Some(frames) = stack_traces.get(stack_id) {
                 println!(
                     "{}",
@@ -234,10 +237,10 @@ async fn main() {
         }
         let duration = start.elapsed().as_millis();
         println!();
-        println!(
+        eprintln!(
             "{}",
             format!("Time taken {duration}ms")
-                .if_supports_color(owo_colors::Stream::Stdout, |text| text.yellow())
+                .if_supports_color(owo_colors::Stream::Stderr, |text| text.yellow())
         );
     });
 
