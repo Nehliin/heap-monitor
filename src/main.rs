@@ -7,6 +7,7 @@ use std::env;
 use std::process;
 use std::ptr;
 use tokio::signal;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -31,6 +32,11 @@ enum BpfEvent {
     Free {
         ptr: u64,
     },
+}
+
+struct AllocationStat {
+    alloc_count: u64,
+    total_size: u64,
 }
 
 async fn event_handler(mut loaded: Loaded, sender: Sender<BpfEvent>) {
@@ -69,6 +75,58 @@ async fn event_handler(mut loaded: Loaded, sender: Sender<BpfEvent>) {
             _ => {}
         }
     }
+}
+
+async fn event_proccessor(
+    mut event_rc: Receiver<BpfEvent>,
+) -> (
+    AHashMap<i64, Box<BpfStackFrames>>,
+    AHashMap<i64, AllocationStat>,
+) {
+    let mut allocations = AHashMap::new();
+    let mut stack_traces = AHashMap::new();
+    let mut allocation_stats: AHashMap<i64, AllocationStat> = AHashMap::new();
+
+    struct Allocation {
+        size: u64,
+        stack_id: i64,
+    }
+
+    while let Some(event) = event_rc.recv().await {
+        match event {
+            BpfEvent::Allocation {
+                ptr,
+                stack_id,
+                size,
+                frames,
+            } => {
+                stack_traces.insert(stack_id, frames);
+                allocations.insert(ptr, Allocation { size, stack_id });
+                if let Some(stats) = allocation_stats.get_mut(&stack_id) {
+                    stats.alloc_count += 1;
+                    stats.total_size += size;
+                } else {
+                    allocation_stats.insert(
+                        stack_id,
+                        AllocationStat {
+                            alloc_count: 1,
+                            total_size: size,
+                        },
+                    );
+                }
+            }
+            BpfEvent::Free { ptr } => {
+                if let Some(Allocation { size, stack_id }) = allocations.remove(&ptr) {
+                    if let Some(stats) = allocation_stats.get_mut(&stack_id) {
+                        stats.alloc_count -= 1;
+                        stats.total_size += size;
+                    }
+                }
+            }
+        }
+    }
+
+    (stack_traces, allocation_stats)
 }
 
 /// Monitor heap usage using bpf probes
@@ -154,53 +212,7 @@ async fn main() {
     });
 
     let event_proccesing_task = tokio::spawn(async move {
-        let mut allocations = AHashMap::new();
-        let mut stack_traces = AHashMap::new();
-        let mut allocation_stats: AHashMap<i64, AllocationStat> = AHashMap::new();
-
-        struct AllocationStat {
-            alloc_count: u64,
-            total_size: u64,
-        }
-
-        struct Allocation {
-            size: u64,
-            stack_id: i64,
-        }
-
-        while let Some(event) = rc.recv().await {
-            match event {
-                BpfEvent::Allocation {
-                    ptr,
-                    stack_id,
-                    size,
-                    frames,
-                } => {
-                    stack_traces.insert(stack_id, frames);
-                    allocations.insert(ptr, Allocation { size, stack_id });
-                    if let Some(stats) = allocation_stats.get_mut(&stack_id) {
-                        stats.alloc_count += 1;
-                        stats.total_size += size;
-                    } else {
-                        allocation_stats.insert(
-                            stack_id,
-                            AllocationStat {
-                                alloc_count: 1,
-                                total_size: size,
-                            },
-                        );
-                    }
-                }
-                BpfEvent::Free { ptr } => {
-                    if let Some(Allocation { size, stack_id }) = allocations.remove(&ptr) {
-                        if let Some(stats) = allocation_stats.get_mut(&stack_id) {
-                            stats.alloc_count -= 1;
-                            stats.total_size += size;
-                        }
-                    }
-                }
-            }
-        }
+        let (stack_traces, allocation_stats) = event_proccessor(rc).await;
 
         let mut symloader = SymLoader::new(pid);
         let mut modules = symloader.load_modules();
