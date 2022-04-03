@@ -1,4 +1,4 @@
-//! Support for the Executable and Linkable Format, used on Linux.
+//! Stolen with slight tweaks from symbolic https://github.com/getsentry/symbolic
 
 use std::borrow::Cow;
 use std::fmt;
@@ -34,7 +34,6 @@ const EF_MIPS_ABI_O32: u32 = 0x0000_1000;
 #[allow(unused)]
 const EF_MIPS_ABI_EABI32: u32 = 0x0000_3000;
 
-
 /// Executable and Linkable Format, used for executables and libraries on Linux.
 pub struct ElfObject<'data> {
     pub elf: elf::Elf<'data>,
@@ -44,12 +43,6 @@ pub struct ElfObject<'data> {
 }
 
 impl<'data> ElfObject<'data> {
-    /// Tests whether the buffer could contain an ELF object.
-    pub fn test(data: &[u8]) -> bool {
-        data.get(0..elf::header::SELFMAG)
-            .map_or(false, |data| data == elf::header::ELFMAG)
-    }
-
     // Pulled from https://github.com/m4b/goblin/blob/master/src/elf/mod.rs#L393-L424 as it
     // currently isn't public, but we need this to parse an ELF.
     fn gnu_hash_len(bytes: &[u8], offset: usize, ctx: Ctx) -> goblin::error::Result<usize> {
@@ -312,11 +305,6 @@ impl<'data> ElfObject<'data> {
         })
     }
 
-    /// The binary's soname, if any.
-    pub fn name(&self) -> Option<&'data str> {
-        self.elf.soname
-    }
-
     /// The kind of this object, as specified in the ELF header.
     /// TODO FIXME
     pub fn kind(self) -> ModuleType<'data> {
@@ -401,29 +389,9 @@ impl<'data> ElfObject<'data> {
         }
     }
 
-    /// Determines whether this object contains debug information.
-    //pub fn has_debug_info(&self) -> bool {
-    //    self.has_section("debug_info")
-    // }
-
-    /// Determines whether this object contains stack unwinding information.
-    // pub fn has_unwind_info(&self) -> bool {
-    //    self.has_section("eh_frame") || self.has_section("debug_frame")
-    // }
-
-    /// Determines whether this object contains embedded source.
-    pub fn has_sources(&self) -> bool {
-        false
-    }
-
     /// Determines whether this object is malformed and was only partially parsed
     pub fn is_malformed(&self) -> bool {
         self.is_malformed
-    }
-
-    /// Returns the raw data of the ELF file.
-    pub fn data(&self) -> &'data [u8] {
-        self.data
     }
 
     /// Decompresses the given compressed section data, if supported.
@@ -475,46 +443,6 @@ impl<'data> ElfObject<'data> {
     pub fn raw_section(&self, name: &str) -> Option<DwarfSection<'data>> {
         let (_, section) = self.find_section(name)?;
         Some(section)
-    }
-
-    pub fn section_from_header(
-        &self,
-        header: &SectionHeader,
-    ) -> Option<(bool, DwarfSection<'data>)> {
-        // TODO
-        if let Some(section_name) = self.elf.shdr_strtab.get_at(header.sh_name) {
-            let offset = header.sh_offset as usize;
-            if offset == 0 {
-                // We're defensive here. On darwin, dsymutil leaves phantom section headers
-                // while stripping their data from the file by setting their offset to 0. We
-                // know that no section can start at an absolute file offset of zero, so we can
-                // safely skip them in case similar things happen on linux.
-                return None;
-            }
-
-            if section_name.is_empty() {
-                panic!("empty section name");
-            }
-
-            // Before SHF_COMPRESSED was a thing, compressed sections were prefixed with `.z`.
-            // Support this as an override to the flag.
-            let (compressed, section_name) = match section_name.strip_prefix(".z") {
-                Some(name) => (true, name),
-                None => (header.sh_flags & SHF_COMPRESSED != 0, &section_name[1..]),
-            };
-
-            let size = header.sh_size as usize;
-            let data = &self.data[offset..][..size];
-            let section = DwarfSection {
-                data: Cow::Borrowed(data),
-                address: header.sh_addr,
-                offset: header.sh_offset,
-                align: header.sh_addralign,
-            };
-
-            return Some((compressed, section));
-        }
-        None
     }
 
     /// Locates and reads a section in an ELF binary.
@@ -665,7 +593,7 @@ impl<'data, 'object> Iterator for ElfSymbolIterator<'data, 'object> {
 
                 return Some(Symbol {
                     name,
-                    // This might not be what's correct 
+                    // This might not be what's correct
                     address: symbol.st_value - load_addr,
                     size: symbol.st_size,
                 });
