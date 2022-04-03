@@ -7,8 +7,10 @@ use std::{
 };
 
 use ahash::AHashMap;
+use anyhow::Context;
+use owo_colors::OwoColorize;
 use symbolic::{
-    common::Name,
+    common::{Language, Name},
     demangle::{Demangle, DemangleOptions},
 };
 
@@ -19,7 +21,7 @@ pub struct ParsedModule {
     end_addr: u64,
     file_offset: u64,
     // dev major, minor
-    //inode: u64,
+    // inode,
     name: String,
 }
 
@@ -51,7 +53,7 @@ impl ParsedModule {
             return None;
         }
 
-        println!("Parsed: {name}");
+        tracing::debug!("Parsed: {name}");
         // TODO: memfd
 
         Some(ParsedModule {
@@ -73,7 +75,6 @@ fn is_mapping_file_backed(name: &str) -> bool {
         && name.starts_with("[vsyscall]"))
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: Option<String>,
@@ -92,7 +93,7 @@ pub enum ModuleType<'data> {
         elf_so_offset: u64,
         elf_so_addr: u64,
     },
-    PerfMap,
+    // PerfMap,
     Vdso,
     Debug,
 }
@@ -193,7 +194,6 @@ fn for_each_sym_core<'data>(
     is_debug_file: bool,
 ) {
     // bcc_for_each_module ish,
-
     if !is_debug_file {
         if let Some(debug_file) = find_debug_file(elf) {
             use std::io::Read;
@@ -210,11 +210,10 @@ fn for_each_sym_core<'data>(
                 tracing::error!("Debug file not parseable!");
             }
         }
-        tracing::warn!("No debug file found TODO");
+        tracing::info!("No debug file found");
     }
     syms.extend(elf.symbols());
 }
-
 
 fn find_debug_file(elf: &ElfObject) -> Option<String> {
     if let Some(debug_file) = find_debug_file_via_symfs(elf) {
@@ -353,7 +352,8 @@ impl<'data> Symbols<'data> {
         addrs: &[u64],
         cache: &mut AHashMap<u64, String>,
         stdout: &Stdout,
-    ) {
+        language: Language,
+    ) -> anyhow::Result<()> {
         let mut stdout = stdout.lock();
         'addr: for addr in addrs.iter() {
             let addr = *addr;
@@ -361,7 +361,7 @@ impl<'data> Symbols<'data> {
                 continue;
             }
             if let Some(cached) = cache.get(&addr) {
-                writeln!(stdout, "Cached: {cached}").unwrap();
+                writeln!(stdout, "      {cached}")?;
                 continue;
             }
             // Find memory region and convert virtual to address within binary
@@ -373,16 +373,19 @@ impl<'data> Symbols<'data> {
                 {
                     // TODO?
                     Ok(index) => {
-                        let symbol = module.syms.get(index).unwrap();
-                        let symbol = symbol.name.as_ref().unwrap().clone();
-                        let name = Name::new(
-                            symbol,
-                            symbolic::common::NameMangling::Unknown,
-                            symbolic::common::Language::Unknown,
-                        );
-                        writeln!(stdout, "Found {module_offset:x}").unwrap();
+                        let symbol = module
+                            .syms
+                            .get(index)
+                            .context("Symbol for the given index not found")?;
+                        let symbol = symbol
+                            .name
+                            .as_ref()
+                            .context("Symbol doesn't have a name")?
+                            .clone();
+                        let name =
+                            Name::new(symbol, symbolic::common::NameMangling::Unknown, language);
                         let name = print_name(Some(&name), true);
-                        writeln!(stdout, "{name}").unwrap();
+                        writeln!(stdout, "      {name}")?;
                         continue 'addr;
                     }
                     Err(index) => {
@@ -397,15 +400,18 @@ impl<'data> Symbols<'data> {
                             // it's a match
                             if module_offset < sym.address + sym.size {
                                 // resolve here if done lazily
-                                let symbol = sym.name.as_ref().unwrap().clone();
+                                let symbol = sym
+                                    .name
+                                    .as_ref()
+                                    .context("Symbol doesn't have a name")?
+                                    .clone();
                                 let name = Name::new(
                                     symbol,
                                     symbolic::common::NameMangling::Unknown,
                                     symbolic::common::Language::Unknown,
                                 );
-                                //        writeln!(stdout, "Found {offset_addr:x}").unwrap();
                                 let name = print_name(Some(&name), true);
-                                writeln!(stdout, "{name}").unwrap();
+                                writeln!(stdout, "      {name}")?;
                                 continue 'addr;
                             }
                             if limit > sym.address + sym.size {
@@ -415,17 +421,30 @@ impl<'data> Symbols<'data> {
                         }
                         writeln!(
                             stdout,
-                            "FAILED TO FIND {module_offset:x}\n at unknown in {}",
-                            module.name
-                        )
-                        .unwrap();
+                            "{}",
+                            format!(
+                                "FAILED TO FIND {module_offset:x}\n at unknown in {}",
+                                module.name
+                            )
+                            .if_supports_color(owo_colors::Stream::Stdout, |text| text.red()),
+                        )?;
                     }
                 }
             } else {
-                writeln!(stdout, "Failed to find module for {addr:x}").unwrap();
-                writeln!(stdout, "??:0").unwrap();
+                writeln!(
+                    stdout,
+                    "{}",
+                    format!("Failed to find module for {addr:x}")
+                        .if_supports_color(owo_colors::Stream::Stdout, |text| text.red())
+                )?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    "??:0".if_supports_color(owo_colors::Stream::Stdout, |text| text.red()),
+                )?;
                 continue;
             }
         }
+        Ok(())
     }
 }

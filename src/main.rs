@@ -1,6 +1,8 @@
 use ahash::AHashMap;
+use clap::ArgEnum;
 use clap::Parser;
 use futures::stream::StreamExt;
+use owo_colors::OwoColorize;
 use std::env;
 use std::process;
 use std::ptr;
@@ -69,31 +71,62 @@ async fn event_handler(mut loaded: Loaded, sender: Sender<BpfEvent>) {
     }
 }
 
-/// Monitor heap usage live usign bpf probes
+/// Monitor heap usage using bpf probes
 #[derive(Debug, Parser)]
 #[clap(author, version, about)]
 struct Args {
     /// Pid of process to monitor
     #[clap(short, long)]
     pid: i32,
-    // demange: bool,
-    // raw addrs:bool
-    // language
-    // verbose
+    /// Verbose tracing logs
+    #[clap(short, long)]
+    verbose: bool,
+    /// Language expected when demangling
+    #[clap(short, long, default_value = "unknown")]
+    lang: symbolic::common::Language,
+    /// Determines if colors should be used in the output
+    #[clap(long, arg_enum, default_value = "auto")]
+    color: Color,
+}
+
+#[derive(ArgEnum, Clone, Copy, Debug)]
+enum Color {
+    Always,
+    Auto,
+    Never,
+}
+
+impl Color {
+    fn init(self) {
+        match self {
+            Color::Always => owo_colors::set_override(true),
+            Color::Auto => {}
+            Color::Never => owo_colors::set_override(false),
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
+    args.color.init();
+
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::TRACE)
+        .with_max_level(if args.verbose {
+            Level::TRACE
+        } else {
+            Level::WARN
+        })
         .finish();
+
     tracing::subscriber::set_global_default(subscriber).unwrap();
+
     if unsafe { libc::geteuid() } != 0 {
         error!("You must be root to use eBPF!");
         process::exit(1);
     }
 
-    let args = Args::parse();
     let pid = args.pid;
 
     let (tx, mut rc) = tokio::sync::mpsc::channel(512);
@@ -106,7 +139,11 @@ async fn main() {
                 .unwrap_or_else(|_| panic!("error attaching uprobe program {}", prb.name()));
         }
 
-        println!("Monitoring heap in PID {}, Hit Ctrl-C to quit!", args.pid);
+        println!(
+            "{}",
+            format!("Monitoring heap in PID {}, Hit Ctrl-C to quit!", args.pid)
+                .if_supports_color(owo_colors::Stream::Stdout, |text| text.green())
+        );
         tokio::select! {
             _ = signal::ctrl_c() => {},
             _ = event_handler(loaded, tx) => {}
@@ -145,7 +182,7 @@ async fn main() {
                         allocation_stats.insert(
                             stack_id,
                             AllocationStat {
-                                alloc_count: 0,
+                                alloc_count: 1,
                                 total_size: size,
                             },
                         );
@@ -168,26 +205,40 @@ async fn main() {
         let mut cache = AHashMap::new();
         let stdout = std::io::stdout();
 
-        println!("Proccessing..");
+        println!(
+            "{}",
+            "Processing...".if_supports_color(owo_colors::Stream::Stdout, |text| text.yellow())
+        );
         let start = std::time::Instant::now();
 
         let mut largest_outstanding: Vec<(i64, AllocationStat)> =
             allocation_stats.into_iter().collect();
-        largest_outstanding.sort_unstable_by(|(_, a), (_, b)| a.total_size.cmp(&b.total_size));
+        largest_outstanding.sort_unstable_by(|(_, a), (_, b)| b.total_size.cmp(&a.total_size));
 
         for (stack_id, alloc_stat) in largest_outstanding.iter().take(10) {
             if let Some(frames) = stack_traces.get(stack_id) {
                 println!(
-                    "Allocated a total of {} bytes from {} separate allocation",
-                    alloc_stat.total_size, alloc_stat.alloc_count
+                    "{}",
+                    format!(
+                        "Allocated a total of {} bytes from {} separate allocations",
+                        alloc_stat.total_size, alloc_stat.alloc_count
+                    )
+                    .if_supports_color(owo_colors::Stream::Stdout, |text| text.bright_blue())
                 );
-                modules.addr_to_line(&frames.ip, &mut cache, &stdout);
+                modules
+                    .addr_to_line(&frames.ip, &mut cache, &stdout, args.lang)
+                    .expect("Failed resolve stack frame");
             } else {
                 tracing::error!("No stack trace found for {stack_id}");
             }
         }
         let duration = start.elapsed().as_millis();
-        println!("Time taken {duration}");
+        println!();
+        println!(
+            "{}",
+            format!("Time taken {duration}ms")
+                .if_supports_color(owo_colors::Stream::Stdout, |text| text.yellow())
+        );
     });
 
     let _ = event_handler_task.await.unwrap();
