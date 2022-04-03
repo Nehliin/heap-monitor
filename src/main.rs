@@ -190,7 +190,7 @@ async fn main() {
 
     let pid = args.pid;
 
-    let (tx, mut rc) = tokio::sync::mpsc::channel(512);
+    let (event_sender, event_rc) = tokio::sync::mpsc::channel(512);
 
     let event_handler_task = tokio::spawn(async move {
         let mut loaded = Loader::load(probe_code()).expect("error loading BPF program");
@@ -207,12 +207,12 @@ async fn main() {
         );
         tokio::select! {
             _ = signal::ctrl_c() => {},
-            _ = event_handler(loaded, tx) => {}
+            _ = event_handler(loaded, event_sender) => {}
         }
     });
 
     let event_proccesing_task = tokio::spawn(async move {
-        let (stack_traces, allocation_stats) = event_proccessor(rc).await;
+        let (stack_traces, allocation_stats) = event_proccessor(event_rc).await;
 
         let mut symloader = SymLoader::new(pid);
         let mut modules = symloader.load_modules();
