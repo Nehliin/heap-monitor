@@ -81,7 +81,7 @@ fn aligned_alloc(regs: Registers) {
 
 #[uprobe]
 fn free(regs: Registers) {
-    let mut f_event = FreeEvent {
+    let f_event = FreeEvent {
         ptr: regs.parm1(),
     };
     unsafe {

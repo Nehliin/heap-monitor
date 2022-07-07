@@ -117,9 +117,15 @@ async fn event_proccessor(
             }
             BpfEvent::Free { ptr } => {
                 if let Some(Allocation { size, stack_id }) = allocations.remove(&ptr) {
-                    if let Some(stats) = allocation_stats.get_mut(&stack_id) {
+                    let should_remove = if let Some(stats) = allocation_stats.get_mut(&stack_id) {
                         stats.alloc_count -= 1;
-                        stats.total_size += size;
+                        stats.total_size -= size;
+                        stats.total_size == 0
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        allocation_stats.remove(&stack_id);
                     }
                 }
             }
